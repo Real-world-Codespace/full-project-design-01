@@ -1,0 +1,84 @@
+project:
+  name: cooling-load-forecasting
+  random_state: 42
+
+paths:
+  raw_data: data/raw/cooling_load.csv
+  interim_data: data/interim/cooling_load_clean.csv
+  feature_data: data/processed/model_features.csv
+  manifest: data/manifests/ingestion_manifest.json
+  model: models/champion.joblib
+  metrics: reports/metrics.json
+  eda_report_dir: reports/figures/eda
+  eda_summary: reports/eda_summary.json
+
+ingestion:
+  mode: local
+  local_source: data/raw/cooling_load.csv
+  s3:
+    bucket: replace-me
+    prefix: cooling-load/raw/
+    profile: cooling-load-dev
+    allowed_extensions: [".csv", ".parquet"]
+    max_workers: 8
+
+data:
+  timestamp_column: timestamp
+  entity_column: building_id
+  target_column: cooling_load_kwh
+  frequency: 1h
+  required_columns:
+    - timestamp
+    - building_id
+    - cooling_load_kwh
+    - outdoor_temperature_c
+    - relative_humidity_pct
+    - chilled_water_supply_c
+    - chilled_water_return_c
+    - chilled_water_flow_m3h
+    - active_chillers
+    - occupancy_proxy
+
+preprocessing:
+  max_ffill_steps: 3
+  numeric_clip_quantiles: [0.005, 0.995]
+
+features:
+  forecast_horizon_hours: 3
+  target_lags: [3, 24, 48, 168]
+  rolling_windows: [6, 24, 168]
+  sensor_columns:
+    - outdoor_temperature_c
+    - relative_humidity_pct
+    - chilled_water_supply_c
+    - chilled_water_return_c
+    - chilled_water_flow_m3h
+    - active_chillers
+    - occupancy_proxy
+
+clustering:
+  n_clusters: 4
+  features:
+    - cooling_load_kwh_lag_3
+    - cooling_load_kwh_mean_24
+    - cooling_load_kwh_std_24
+    - outdoor_temperature_c_lag_3
+    - chilled_water_flow_m3h_lag_3
+    - active_chillers_lag_3
+
+training:
+  validation_periods: 3
+  min_train_fraction: 0.5
+  scoring: neg_root_mean_squared_error
+  search_iterations: 8
+
+api:
+  title: Cooling Load Forecasting API
+  version: 0.1.0
+
+model_registry:
+  enabled: false
+  bucket: replace-me
+  prefix: cooling-load/models
+  profile: null
+  server_side_encryption: AES256

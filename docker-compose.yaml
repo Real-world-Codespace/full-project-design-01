@@ -1,0 +1,13 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      MODEL_PATH: /app/models/champion.joblib
+      MODEL_S3_URI: ${MODEL_S3_URI:-}
+      MODEL_SHA256: ${MODEL_SHA256:-}
+      COOLING_LOAD_CONFIG: /app/configs/base.yaml
+    volumes:
+      - ./models:/app/models:ro
+    restart: unless-stopped
