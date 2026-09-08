@@ -20,7 +20,7 @@ lag/rolling/HVAC features
       │
       ├── K-Means operating regimes (fit on train only)
       ▼
-temporal CV → model comparison → tuning
+temporal CV → chọn họ model tốt nhất → tuning đúng họ model đã chọn
       │
       ▼
 versioned model bundle

@@ -9,7 +9,11 @@ import numpy as np
 import pandas as pd
 from sklearn.compose import ColumnTransformer
 from sklearn.dummy import DummyRegressor
-from sklearn.ensemble import ExtraTreesRegressor, HistGradientBoostingRegressor, RandomForestRegressor
+from sklearn.ensemble import (
+    ExtraTreesRegressor,
+    HistGradientBoostingRegressor,
+    RandomForestRegressor,
+)
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import mean_squared_error
 from sklearn.pipeline import Pipeline
@@ -21,7 +25,6 @@ from cooling_load.splitting import ExpandingTimestampSplit
 class ModelSelectionResult:
     leaderboard: pd.DataFrame
     champion_name: str
-    champion: Pipeline
 
 
 def candidate_models(random_state: int = 42) -> dict[str, Any]:
@@ -56,12 +59,15 @@ def select_model(
     n_splits: int = 3,
     min_train_fraction: float = 0.5,
     models: dict[str, Any] | None = None,
+    random_state: int = 42,
 ) -> ModelSelectionResult:
     working_features = ["__timestamp", *feature_columns]
-    X = train[[timestamp_column, *feature_columns]].rename(columns={timestamp_column: "__timestamp"})
+    X = train[[timestamp_column, *feature_columns]].rename(
+        columns={timestamp_column: "__timestamp"}
+    )
     y = train[target_column]
     splitter = ExpandingTimestampSplit(n_splits=n_splits, min_train_fraction=min_train_fraction)
-    estimators = models or candidate_models()
+    estimators = models or candidate_models(random_state=random_state)
     rows: list[dict[str, object]] = []
     best_score = float("inf")
     best_name = ""
@@ -71,41 +77,108 @@ def select_model(
             pipeline = build_pipeline(feature_columns, estimator)
             pipeline.fit(X.iloc[train_index][feature_columns], y.iloc[train_index])
             prediction = pipeline.predict(X.iloc[validation_index][feature_columns])
-            fold_scores.append(float(mean_squared_error(y.iloc[validation_index], prediction) ** 0.5))
+            fold_scores.append(
+                float(mean_squared_error(y.iloc[validation_index], prediction) ** 0.5)
+            )
         score = float(np.mean(fold_scores))
-        rows.append({"model": name, "cv_rmse_mean": score, "cv_rmse_std": float(np.std(fold_scores))})
+        rows.append(
+            {
+                "model": name,
+                "cv_rmse_mean": score,
+                "cv_rmse_std": float(np.std(fold_scores)),
+            }
+        )
         if score < best_score:
             best_score, best_name = score, name
     leaderboard = pd.DataFrame(rows).sort_values("cv_rmse_mean").reset_index(drop=True)
-    champion = build_pipeline(feature_columns, estimators[best_name])
-    champion.fit(train[feature_columns], y)
-    return ModelSelectionResult(leaderboard=leaderboard, champion_name=best_name, champion=champion)
+    return ModelSelectionResult(leaderboard=leaderboard, champion_name=best_name)
 
 
-def tune_tree_model(
+def _tuning_candidates(model_name: str, random_state: int) -> list[tuple[Any, dict[str, object]]]:
+    """Return a small, deterministic search space for the selected model family."""
+    parameter_sets: dict[str, list[dict[str, object]]] = {
+        "median_baseline": [{}],
+        "random_forest": [
+            {"n_estimators": 300, "max_depth": None, "min_samples_leaf": 2, "max_features": 1.0},
+            {"n_estimators": 300, "max_depth": 18, "min_samples_leaf": 3, "max_features": 0.8},
+            {"n_estimators": 450, "max_depth": 24, "min_samples_leaf": 2, "max_features": 0.7},
+            {"n_estimators": 450, "max_depth": None, "min_samples_leaf": 4, "max_features": 0.9},
+        ],
+        "extra_trees": [
+            {"n_estimators": 300, "max_depth": None, "min_samples_leaf": 2, "max_features": 1.0},
+            {"n_estimators": 300, "max_depth": 18, "min_samples_leaf": 3, "max_features": 0.8},
+            {"n_estimators": 450, "max_depth": 24, "min_samples_leaf": 2, "max_features": 0.7},
+            {"n_estimators": 450, "max_depth": None, "min_samples_leaf": 4, "max_features": 0.9},
+        ],
+        "hist_gradient_boosting": [
+            {
+                "max_iter": 200,
+                "learning_rate": 0.04,
+                "max_leaf_nodes": 15,
+                "l2_regularization": 0.0,
+            },
+            {
+                "max_iter": 250,
+                "learning_rate": 0.06,
+                "max_leaf_nodes": 31,
+                "l2_regularization": 0.0,
+            },
+            {
+                "max_iter": 350,
+                "learning_rate": 0.04,
+                "max_leaf_nodes": 31,
+                "l2_regularization": 0.1,
+            },
+            {
+                "max_iter": 250,
+                "learning_rate": 0.08,
+                "max_leaf_nodes": 63,
+                "l2_regularization": 0.1,
+            },
+        ],
+    }
+    if model_name not in parameter_sets:
+        raise ValueError(f"Unsupported model family for tuning: {model_name}")
+
+    candidates: list[tuple[Any, dict[str, object]]] = []
+    for params in parameter_sets[model_name]:
+        if model_name == "median_baseline":
+            estimator = DummyRegressor(strategy="median")
+        elif model_name == "random_forest":
+            estimator = RandomForestRegressor(**params, n_jobs=-1, random_state=random_state)
+        elif model_name == "extra_trees":
+            estimator = ExtraTreesRegressor(**params, n_jobs=-1, random_state=random_state)
+        else:
+            estimator = HistGradientBoostingRegressor(**params, random_state=random_state)
+        candidates.append((estimator, params))
+    return candidates
+
+
+def tune_selected_model(
     train: pd.DataFrame,
     validation: pd.DataFrame,
     feature_columns: list[str],
     target_column: str,
+    model_name: str,
     random_state: int = 42,
+    max_trials: int | None = None,
 ) -> tuple[Pipeline, pd.DataFrame]:
-    """Small deterministic search suitable for a notebook and CI smoke run."""
-    combinations = [
-        {"n_estimators": 300, "max_depth": None, "min_samples_leaf": 2, "max_features": 1.0},
-        {"n_estimators": 300, "max_depth": 18, "min_samples_leaf": 3, "max_features": 0.8},
-        {"n_estimators": 450, "max_depth": 24, "min_samples_leaf": 2, "max_features": 0.7},
-        {"n_estimators": 450, "max_depth": None, "min_samples_leaf": 4, "max_features": 0.9},
-    ]
+    """Tune only the model family selected by temporal cross-validation."""
+    candidates = _tuning_candidates(model_name, random_state)
+    if max_trials is not None:
+        if max_trials < 1:
+            raise ValueError("max_trials must be at least 1")
+        candidates = candidates[:max_trials]
+
     trials: list[dict[str, object]] = []
     best_pipeline: Pipeline | None = None
     best_rmse = float("inf")
-    for params in combinations:
-        model = ExtraTreesRegressor(**params, n_jobs=-1, random_state=random_state)
-        pipeline = build_pipeline(feature_columns, model)
+    for estimator, params in candidates:
+        pipeline = build_pipeline(feature_columns, estimator)
         pipeline.fit(train[feature_columns], train[target_column])
         prediction = pipeline.predict(validation[feature_columns])
         rmse = float(mean_squared_error(validation[target_column], prediction) ** 0.5)
-        trials.append({**params, "validation_rmse": rmse})
+        trials.append({"model": model_name, **params, "validation_rmse": rmse})
         if rmse < best_rmse:
             best_rmse, best_pipeline = rmse, pipeline
     assert best_pipeline is not None

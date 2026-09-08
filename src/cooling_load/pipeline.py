@@ -16,7 +16,7 @@ from cooling_load.evaluation import regression_metrics
 from cooling_load.features import CoolingLoadFeatureBuilder, model_feature_columns
 from cooling_load.ingestion import ingest_dataset
 from cooling_load.io import read_frame, write_frame
-from cooling_load.modeling import select_model, tune_tree_model
+from cooling_load.modeling import select_model, tune_selected_model
 from cooling_load.preprocessing import preprocess_sensor_data
 from cooling_load.registry import publish_model_bundle
 from cooling_load.splitting import temporal_holdout
@@ -76,9 +76,14 @@ def run_training(config: ProjectConfig, featured: pd.DataFrame) -> dict[str, obj
     test = clusterer.transform(test)
     feature_columns = model_feature_columns(train, config.data)
     # K-Means labels and distance are available to the supervised model.
-    feature_columns.extend([column for column in ["operating_cluster", "cluster_distance"] if column not in feature_columns])
+    feature_columns.extend(
+        column
+        for column in ["operating_cluster", "cluster_distance"]
+        if column not in feature_columns
+    )
 
     training = config.raw["training"]
+    random_state = int(config.raw["project"]["random_state"])
     selection = select_model(
         train,
         feature_columns,
@@ -86,13 +91,17 @@ def run_training(config: ProjectConfig, featured: pd.DataFrame) -> dict[str, obj
         timestamp,
         n_splits=int(training["validation_periods"]),
         min_train_fraction=float(training["min_train_fraction"]),
+        random_state=random_state,
     )
-    tuned_model, tuning_results = tune_tree_model(
+    # Tune the exact model family that won the expanding-window comparison.
+    tuned_model, tuning_results = tune_selected_model(
         train,
         validation,
         feature_columns,
         target,
-        random_state=int(config.raw["project"]["random_state"]),
+        model_name=selection.champion_name,
+        random_state=random_state,
+        max_trials=int(training["search_iterations"]),
     )
     validation_prediction = tuned_model.predict(validation[feature_columns])
     validation_metrics = regression_metrics(validation[target], validation_prediction)
@@ -109,7 +118,7 @@ def run_training(config: ProjectConfig, featured: pd.DataFrame) -> dict[str, obj
         feature_columns=feature_columns,
         project_config=config.raw,
         metrics=test_metrics,
-        model_name="tuned_extra_trees",
+        model_name=selection.champion_name,
     )
     model_path = save_bundle(bundle, config.path("model"))
     registry_settings = config.raw.get("model_registry", {})
@@ -128,10 +137,13 @@ def run_training(config: ProjectConfig, featured: pd.DataFrame) -> dict[str, obj
     payload = {"validation": validation_metrics, "test": test_metrics}
     metrics_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
-    test_predictions = test[[timestamp, config.data.entity_column, target, "operating_regime"]].copy()
+    test_predictions = test[
+        [timestamp, config.data.entity_column, target, "operating_regime"]
+    ].copy()
     test_predictions["prediction"] = test_prediction
     return {
         "leaderboard": selection.leaderboard,
+        "champion_name": selection.champion_name,
         "tuning_results": tuning_results,
         "validation_metrics": validation_metrics,
         "test_metrics": test_metrics,
